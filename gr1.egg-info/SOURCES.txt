@@ -17,3 +17,5 @@ gr1/models/transformer_utils.py
 gr1/models/vision_transformer.py
 gr1/utils/__init__.py
 gr1/utils/calvin_utils.py
+gr1/utils/dist_train.py
+gr1/utils/utils.py
