@@ -90,7 +90,8 @@ class GR1CalvinEvaluation(CalvinBaseModel):
             activation_function=variant['activation_function'],
             n_positions=variant['n_positions'],
             resid_pdrop=variant['dropout'],
-            attn_pdrop=variant['dropout'])
+            attn_pdrop=variant['dropout']
+            )
         print(f"loading state dict: {policy_ckpt}...")
         payload = torch.load(policy_ckpt)
         state_dict = payload['state_dict']

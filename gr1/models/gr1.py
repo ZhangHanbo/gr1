@@ -15,14 +15,220 @@
 """GR-1 model."""
 import torch
 import torch.nn as nn
+import copy
+import numpy as np
+from torch.autograd import Variable
+from einops import rearrange
 
 import transformers
 from flamingo_pytorch import PerceiverResampler
 
-from models.trajectory_gpt2 import GPT2Model
-from models.vision_transformer import Block
-from models.transformer_utils import get_2d_sincos_pos_embed
+from gr1.models.trajectory_gpt2 import GPT2Model
+from gr1.models.vision_transformer import Block
+from gr1.models.transformer_utils import get_2d_sincos_pos_embed
 
+
+def reparametrize(mu, logvar):
+    std = logvar.div(2).exp()
+    eps = Variable(std.data.new(std.size()).normal_())
+    return mu + std * eps
+
+
+def get_sinusoid_encoding_table(n_position, d_hid):
+    def get_position_angle_vec(position):
+        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)]
+
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
+    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
+    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
+
+    return torch.FloatTensor(sinusoid_table)
+
+def _get_clones(module, N):
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+
+def kl_divergence(mu, logvar):
+    batch_size = mu.size(0)
+    assert batch_size != 0
+    if mu.data.ndimension() == 4:
+        mu = mu.view(mu.size(0), mu.size(1))
+    if logvar.data.ndimension() == 4:
+        logvar = logvar.view(logvar.size(0), logvar.size(1))
+
+    klds = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    total_kld = klds.sum(1).mean(0, True)
+    dimension_wise_kld = klds.mean(0)
+    mean_kld = klds.mean(1).mean(0, True)
+
+    return total_kld, dimension_wise_kld, mean_kld
+
+class MultiBlock(nn.Module):
+    def __init__(self, layer, num_layer, norm, pos_embed):
+        super().__init__()
+        assert isinstance(layer, Block)
+        self.layers = _get_clones(layer, num_layer)
+        self.norm = norm
+        self.pos_embed = pos_embed
+
+    def forward(self, x):
+        # x: (bs, seq_len, hidden_size)
+        x += self.pos_embed[:x.shape[1]][None, ...].to(x.device)
+        for blk in self.layers:
+            x = blk(x)
+        x = self.norm(x)
+        return x
+
+
+class FcActHead(nn.Module):
+    def __init__(self, hidden_size, act_dim):
+        super().__init__()
+        # Action prediction
+        self.act_dim = act_dim
+        self.pred_act_mlps = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size//2),
+            nn.Linear(hidden_size//2, hidden_size//2)])
+        self.pred_arm_act = nn.Linear(hidden_size//2, self.act_dim-1) # arm action
+        self.pred_gripper_act = nn.Linear(hidden_size//2, 1) # gripper action (binary)
+
+    def forward(self, action_embedding, **kwargs):
+        for pred_act_mlp in self.pred_act_mlps:
+            action_embedding = pred_act_mlp(action_embedding)
+        arm_action_preds = self.pred_arm_act(action_embedding)  # (b, l, act_dim - 1)
+        gripper_action_preds = self.pred_gripper_act(action_embedding)  # (b, l, 1)
+        return {
+            'arm_action_preds': arm_action_preds,
+            'gripper_action_preds': gripper_action_preds
+        }
+
+
+class VAEPolicy(nn.Module):
+    # modified from: https://github.com/tonyzhaozh/act/blob/main/policy.py
+    def __init__(self, hidden_size, act_dim, fwd_pred_next_n, vae_latent_size=256, d_enc=3, d_dec=3, down_sample=None, **kwargs):
+        """
+        hidden_size: hidden size of the input embeddings
+        act_dim: action dimension
+        fwd_pred_next_n: number of future steps to predict, also known as chunk_size
+        vae_latent_size: size of the latent variable for 
+        d_enc: number of encoder layers
+        d_dec: number of decoder layers
+        down_sample: 'pooling' or 'none'. If 'pooling', use global pooling to down-sample the action embeddings, 
+            else 'none' to keep the original size.
+        """
+        
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.action_dim = act_dim
+        self.down_sample = down_sample
+
+        self.kl_weight = kwargs.get('kl_weight', 1.0)
+        print(f'KL Weight {self.kl_weight}')
+
+        self.fwd_pred_next_n = fwd_pred_next_n
+        self.latent_dim = vae_latent_size # final size of latent z # TODO tune
+
+        # encoder: (ENC_CLS, ACT) -> ENC_CLS -> latents
+        self.cls_embed = nn.Embedding(1, self.hidden_size) # extra cls token embedding
+        self.encoder_action_proj = nn.Linear(self.action_dim, self.hidden_size) # project action to embedding
+        self.register_buffer('enc_pos_embeddings', get_sinusoid_encoding_table(1+self.fwd_pred_next_n, self.hidden_size))
+        self.encoder = MultiBlock(
+            Block(self.hidden_size, 16, 4, qkv_bias=True, norm_layer=nn.LayerNorm),
+            d_enc, nn.LayerNorm(self.hidden_size),
+            self.enc_pos_embeddings
+        )
+        self.latent_proj = nn.Linear(self.hidden_size, self.latent_dim*2) # project hidden state to latent std, var
+
+        # decoder: latents -> ENC_CLS + conditions: (OBS, QUERY) -> QUERY
+        self.query_embed = nn.Embedding(fwd_pred_next_n, self.hidden_size)
+        self.latent_out_proj = nn.Linear(self.latent_dim, self.hidden_size) # project latent sample to embedding
+        self.global_1d_pool = nn.AdaptiveAvgPool1d(latent) # global pooling for down-sampling, typically latent is 1.
+        self.register_buffer('dec_pos_embeddings', get_sinusoid_encoding_table(1024, self.hidden_size))
+        self.decoder = MultiBlock(
+            Block(self.hidden_size, 16, 4, qkv_bias=True, norm_layer=nn.LayerNorm),
+            d_dec, nn.LayerNorm(self.hidden_size),
+            self.dec_pos_embeddings
+        )
+
+        self.act_head = FcActHead(self.hidden_size, self.action_dim)
+        self.cached_variables = {}
+
+    def forward(self, action_embeddings, actions=None, **kwargs):
+        """
+        action_embeddings: b x l x n x d
+        actions: only for training the auto-encoder, b x l x chunk_size x act_dim
+        """
+        assert action_embeddings.dim() == 4
+        # HACK: for now, actions may not be None during testing due to legacy code. Fix it when possible to keep codes clean.
+        if not self.training:
+            actions = None
+
+        bs, seq_len, _, _  = action_embeddings.shape
+
+        if self.training:
+            bs_a, seq_len_a, chunk_size, _ = actions.shape
+
+            assert chunk_size == self.fwd_pred_next_n
+            assert bs_a == bs and seq_len_a == seq_len
+
+            # project action sequence to embedding dim, and concat with a CLS token
+            actions = rearrange(actions, 'b l n d -> (b l) n d', b=bs, l=seq_len)
+            action_embed = self.encoder_action_proj(actions) # (bs*seq, chunk_size, hidden_size)
+
+            cls_embed = self.cls_embed.weight # (1, hidden_size)
+            cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs * seq_len, 1, 1) # (bs*seq, 1, hidden_size)
+
+            encoder_input = torch.cat([cls_embed, action_embed], axis=1) # (bs*seq, chunk_size+1, hidden_size)
+
+            # query model, output: (bs*seq, chunk_size + 1, hidden_size)
+            encoder_output = self.encoder(encoder_input)
+            encoder_output = encoder_output[:, 0] # take cls output only, (bs*seq, hidden_size)
+
+            latent_info = self.latent_proj(encoder_output)
+            mu = latent_info[:, :self.latent_dim]
+            logvar = latent_info[:, self.latent_dim:]
+            latent_sample = reparametrize(mu, logvar)
+            latent_input = self.latent_out_proj(latent_sample) # (bs*seq, hidden_size)
+
+        else:
+            # here for testing, we only use zero-vector as the latent variale.
+            # if one wants multi-modal, this vector should be sampled from normalized gaussian distribution.
+            mu = logvar = None
+            latent_sample = torch.zeros([bs * seq_len, self.latent_dim], dtype=torch.float32).to(action_embeddings.device)
+            latent_input = self.latent_out_proj(latent_sample) # (bs*seq, hidden_size)
+
+        if self.down_sample == 'pooling':
+            action_embeddings = rearrange(action_embeddings, 'b l n d-> (b l) n d')
+            action_embeddings = self.global_1d_pool(action_embeddings.permute(0, 2, 1))
+            action_embeddings = rearrange(action_embeddings, 'b d n-> b n d')
+            # tok_seq = rearrange(tok_seq, '(b l) d n -> b l n d', b=bs, l=seq_len)
+        elif self.down_sample == 'none':
+            action_embeddings = rearrange(action_embeddings, 'b l n d-> (b l) n d')
+        else:
+            raise NotImplementedError
+
+        assert action_embeddings.dim() == 3 and action_embeddings.shape[0] == bs * seq_len
+
+        latent_input = latent_input[:, None] # (bs*seq, 1, hidden_size)
+        # (bs*seq, 1+latent+chunk_size, hidden_size)
+        dec_input = torch.cat([latent_input, action_embeddings, self.query_embed.weight[None, ...].repeat(bs * seq_len, 1, 1)], dim=1)
+        # take the embeddings of queries only
+        dec_output = self.decoder(dec_input)[:, -self.fwd_pred_next_n:, :]
+
+        arm_and_gripper = self.act_head(dec_output)
+        actions = arm_and_gripper['arm_action_preds']
+        gripper = arm_and_gripper['gripper_action_preds']
+        
+        actions = rearrange(actions, '(b l) n d -> b l n d', b=bs, l=seq_len, n=self.fwd_pred_next_n)
+        gripper = rearrange(gripper, '(b l) n d -> b l n d', b=bs, l=seq_len, n=self.fwd_pred_next_n).squeeze(-1)
+
+        outputs = {}
+        outputs['arm_action_preds'] = actions
+        outputs['gripper_action_preds'] = gripper
+        outputs['mu'] = mu
+        outputs['logvar'] = logvar
+
+        return outputs
+    
 
 class GR1(nn.Module):
     def __init__(
@@ -40,6 +246,7 @@ class GR1(nn.Module):
             resampler_params,
             without_norm_pixel_loss=False,
             use_hand_rgb=True,
+            act_head='FC', # from FC or VAE
             **kwargs
     ):
         super().__init__()
@@ -123,12 +330,12 @@ class GR1(nn.Module):
         self.obs_queries = nn.Embedding(self.n_patch_latents + 1, self.hidden_size)
         self.obs_hand_queries = nn.Embedding(self.n_patch_latents + 1, self.hidden_size)
 
-        # Action prediction
-        self.pred_act_mlps = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size//2),
-            nn.Linear(hidden_size//2, hidden_size//2)])
-        self.pred_arm_act = nn.Linear(hidden_size//2, self.act_dim-1) # arm action
-        self.pred_gripper_act = nn.Linear(hidden_size//2, 1) # gripper action (binary)
+        # Action head
+        if act_head == 'FC':
+            self.pred_act_head = FcActHead(hidden_size, act_dim)
+        else:
+            assert act_head == 'VAE', f"act_head should be 'FC' or 'VAE', got {act_head}"
+            self.pred_act_head = VAEActHead(hidden_size, act_dim)
         
         # Forward prediction
         self.decoder_embed = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -146,11 +353,15 @@ class GR1(nn.Module):
 
     def forward(self, 
                 rgb, 
-                hand_rgb, 
                 state, 
                 language, 
-                attention_mask
+                attention_mask,
+                hand_rgb=None, 
+                action=None, # to train VAE, we need take actions as input
     ):
+        if self.use_hand_rgb:
+            assert hand_rgb is not None
+
         obs_preds = None
         obs_hand_preds = None
         obs_targets = None
@@ -313,11 +524,12 @@ class GR1(nn.Module):
         # Action prediction
         if self.act_pred:
             action_embedding = x[:, :, act_query_token_start_i]
-            for pred_act_mlp in self.pred_act_mlps:
-                action_embedding = pred_act_mlp(action_embedding)
-            arm_action_preds = self.pred_arm_act(action_embedding)  # (b, l, act_dim - 1)
-            gripper_action_preds = self.pred_gripper_act(action_embedding)  # (b, l, 1)
-            
+            prediction = self.pred_act_head(action_embedding, action=action)
+            arm_action_preds = prediction['arm_action_preds']
+            gripper_action_preds = prediction['gripper_action_preds']
+            mu = prediction.get('mu', None)
+            log_sigma = prediction.get('log_sigma', None)
+
         # Forward prediction
         if self.fwd_pred:
             mask_token = self.mask_token  # (1, 1, 1, h)
@@ -346,11 +558,13 @@ class GR1(nn.Module):
                 obs_hand_preds = obs_hand_preds[:, :, (self.n_patch_latents+n_obs_tokens):]
         
         prediction = {
-            'obs_preds': obs_preds,
-            'obs_targets': obs_targets,
-            'obs_hand_preds': obs_hand_preds,
-            'obs_hand_targets': obs_hand_targets,
-            'arm_action_preds': arm_action_preds,
-            'gripper_action_preds': gripper_action_preds,
+            'obs_preds': obs_preds, # (b, l, n_patches, p*p*3)
+            'obs_targets': obs_targets, # (b, l, n_patches, p*p*3)
+            'obs_hand_preds': obs_hand_preds, # (b, l, n_patches, p*p*3)
+            'obs_hand_targets': obs_hand_targets, # (b, l, n_patches, p*p*3)
+            'arm_action_preds': arm_action_preds, # (b, l, act_dim - 1)
+            'gripper_action_preds': gripper_action_preds, # (b, l, 1)
+            'mu': mu, 
+            'log_sigma': log_sigma,
         }
         return prediction

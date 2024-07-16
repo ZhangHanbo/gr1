@@ -1,0 +1,12 @@
+packaging==21.3
+flamingo_pytorch
+tensorboard
+ftfy
+regex
+tqdm
+matplotlib
+torch
+torchvision
+torchaudio
+transformers
+git+https://github.com/openai/CLIP.git
