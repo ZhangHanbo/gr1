@@ -49,7 +49,7 @@ from filelock import FileLock
 from .versions import importlib_metadata
 
 from .hf_api import HfFolder
-from . import logging
+from . import logging, __version__
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -1265,6 +1265,29 @@ def http_get(url: str, temp_file: BinaryIO, proxies=None, resume_size=0, headers
             progress.update(len(chunk))
             temp_file.write(chunk)
     progress.close()
+
+
+def http_user_agent(user_agent: Union[Dict, str, None] = None) -> str:
+    """
+    Formats a user-agent string with basic info about a request.
+    """
+    ua = f"transformers/{__version__}; python/{sys.version.split()[0]}; session_id/{SESSION_ID}"
+    if is_torch_available():
+        ua += f"; torch/{_torch_version}"
+    if is_tf_available():
+        ua += f"; tensorflow/{_tf_version}"
+    if DISABLE_TELEMETRY:
+        return ua + "; telemetry/off"
+    if is_training_run_on_sagemaker():
+        ua += "; " + "; ".join(f"{k}/{v}" for k, v in define_sagemaker_information().items())
+    # CI will set this value to True
+    if os.environ.get("TRANSFORMERS_IS_CI", "").upper() in ENV_VARS_TRUE_VALUES:
+        ua += "; is_ci/true"
+    if isinstance(user_agent, dict):
+        ua += "; " + "; ".join(f"{k}/{v}" for k, v in user_agent.items())
+    elif isinstance(user_agent, str):
+        ua += "; " + user_agent
+    return ua
 
 
 def get_from_cache(

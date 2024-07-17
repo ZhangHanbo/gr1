@@ -26,6 +26,7 @@ from flamingo_pytorch import PerceiverResampler
 from gr1.models.trajectory_gpt2 import GPT2Model
 from gr1.models.vision_transformer import Block
 from gr1.models.transformer_utils import get_2d_sincos_pos_embed
+from .configuration_gpt2 import GPT2Config
 
 
 def reparametrize(mu, logvar):
@@ -81,30 +82,39 @@ class MultiBlock(nn.Module):
 
 
 class FcActHead(nn.Module):
-    def __init__(self, hidden_size, act_dim):
+    def __init__(self, hidden_size, arm_act_dim, gripper_act_dim, chunk_size):
         super().__init__()
         # Action prediction
-        self.act_dim = act_dim
+        self.chunk_size = chunk_size
+        self.arm_act_dim = arm_act_dim
+        self.gripper_act_dim = gripper_act_dim
         self.pred_act_mlps = nn.ModuleList([
             nn.Linear(hidden_size, hidden_size//2),
             nn.Linear(hidden_size//2, hidden_size//2)])
-        self.pred_arm_act = nn.Linear(hidden_size//2, self.act_dim-1) # arm action
-        self.pred_gripper_act = nn.Linear(hidden_size//2, 1) # gripper action (binary)
+        self.pred_arm_act = nn.Linear(hidden_size//2, self.arm_act_dim * self.chunk_size) # arm action
+        self.pred_gripper_act = nn.Linear(hidden_size//2, self.gripper_act_dim * chunk_size) # gripper action (binary)
 
     def forward(self, action_embedding, **kwargs):
+        """
+        action_embedding: (b, l, h)
+        """
         for pred_act_mlp in self.pred_act_mlps:
             action_embedding = pred_act_mlp(action_embedding)
-        arm_action_preds = self.pred_arm_act(action_embedding)  # (b, l, act_dim - 1)
-        gripper_action_preds = self.pred_gripper_act(action_embedding)  # (b, l, 1)
+        
+        bs, seq_len, _ = action_embedding.shape
+        arm_action_preds = self.pred_arm_act(action_embedding)  # (b, l, arm_dim * chunk_size)
+        gripper_action_preds = self.pred_gripper_act(action_embedding)  # (b, l, arm_dim * chunk_size)
+        arm_action_preds = arm_action_preds.view(bs, seq_len, self.chunk_size, self.arm_act_dim)
+        gripper_action_preds = gripper_action_preds.view(bs, seq_len, self.chunk_size, self.gripper_act_dim)
         return {
             'arm_action_preds': arm_action_preds,
             'gripper_action_preds': gripper_action_preds
         }
-
+    
 
 class VAEPolicy(nn.Module):
     # modified from: https://github.com/tonyzhaozh/act/blob/main/policy.py
-    def __init__(self, hidden_size, act_dim, fwd_pred_next_n, vae_latent_size=256, d_enc=3, d_dec=3, down_sample=None, **kwargs):
+    def __init__(self, hidden_size, arm_act_dim, gripper_act_dim, chunk_size, vae_latent_size=256, d_enc=3, d_dec=3, down_sample='none', **kwargs):
         """
         hidden_size: hidden size of the input embeddings
         act_dim: action dimension
@@ -117,8 +127,10 @@ class VAEPolicy(nn.Module):
         """
         
         super().__init__()
+        fwd_pred_next_n = chunk_size
         self.hidden_size = hidden_size
-        self.action_dim = act_dim
+        self.arm_act_dim = arm_act_dim
+        self.gripper_act_dim = gripper_act_dim
         self.down_sample = down_sample
 
         self.kl_weight = kwargs.get('kl_weight', 1.0)
@@ -129,7 +141,7 @@ class VAEPolicy(nn.Module):
 
         # encoder: (ENC_CLS, ACT) -> ENC_CLS -> latents
         self.cls_embed = nn.Embedding(1, self.hidden_size) # extra cls token embedding
-        self.encoder_action_proj = nn.Linear(self.action_dim, self.hidden_size) # project action to embedding
+        self.encoder_action_proj = nn.Linear(self.arm_act_dim + self.gripper_act_dim, self.hidden_size) # project action to embedding
         self.register_buffer('enc_pos_embeddings', get_sinusoid_encoding_table(1+self.fwd_pred_next_n, self.hidden_size))
         self.encoder = MultiBlock(
             Block(self.hidden_size, 16, 4, qkv_bias=True, norm_layer=nn.LayerNorm),
@@ -141,7 +153,7 @@ class VAEPolicy(nn.Module):
         # decoder: latents -> ENC_CLS + conditions: (OBS, QUERY) -> QUERY
         self.query_embed = nn.Embedding(fwd_pred_next_n, self.hidden_size)
         self.latent_out_proj = nn.Linear(self.latent_dim, self.hidden_size) # project latent sample to embedding
-        self.global_1d_pool = nn.AdaptiveAvgPool1d(latent) # global pooling for down-sampling, typically latent is 1.
+        self.global_1d_pool = nn.AdaptiveAvgPool1d(1) # global pooling for down-sampling, typically latent is 1.
         self.register_buffer('dec_pos_embeddings', get_sinusoid_encoding_table(1024, self.hidden_size))
         self.decoder = MultiBlock(
             Block(self.hidden_size, 16, 4, qkv_bias=True, norm_layer=nn.LayerNorm),
@@ -149,14 +161,19 @@ class VAEPolicy(nn.Module):
             self.dec_pos_embeddings
         )
 
-        self.act_head = FcActHead(self.hidden_size, self.action_dim)
+        self.act_head = FcActHead(self.hidden_size, self.arm_act_dim, self.gripper_act_dim, 1)
         self.cached_variables = {}
 
-    def forward(self, action_embeddings, actions=None, **kwargs):
+    def forward(self, action_embeddings, action=None, **kwargs):
         """
-        action_embeddings: b x l x n x d
-        actions: only for training the auto-encoder, b x l x chunk_size x act_dim
+        action_embeddings: b x l x d or b x l x n x d
+        action: only for training the auto-encoder, b x l x chunk_size x act_dim
         """
+        # adapt to traditional input names
+        actions = action
+
+        if action_embeddings.dim() == 3:
+            action_embeddings = action_embeddings[:, :, None, :]
         assert action_embeddings.dim() == 4
         # HACK: for now, actions may not be None during testing due to legacy code. Fix it when possible to keep codes clean.
         if not self.training:
@@ -215,8 +232,8 @@ class VAEPolicy(nn.Module):
         dec_output = self.decoder(dec_input)[:, -self.fwd_pred_next_n:, :]
 
         arm_and_gripper = self.act_head(dec_output)
-        actions = arm_and_gripper['arm_action_preds']
-        gripper = arm_and_gripper['gripper_action_preds']
+        actions = arm_and_gripper['arm_action_preds'].squeeze()
+        gripper = arm_and_gripper['gripper_action_preds'].squeeze()
         
         actions = rearrange(actions, '(b l) n d -> b l n d', b=bs, l=seq_len, n=self.fwd_pred_next_n)
         gripper = rearrange(gripper, '(b l) n d -> b l n d', b=bs, l=seq_len, n=self.fwd_pred_next_n).squeeze(-1)
@@ -237,6 +254,7 @@ class GR1(nn.Module):
             model_mae,
             state_dim,
             act_dim,
+            chunk_size,
             hidden_size,
             sequence_length,
             training_target,
@@ -244,6 +262,7 @@ class GR1(nn.Module):
             patch_feat_dim,
             lang_feat_dim,
             resampler_params,
+            fwd_pred_next_n = 1,
             without_norm_pixel_loss=False,
             use_hand_rgb=True,
             act_head='FC', # from FC or VAE
@@ -251,12 +270,23 @@ class GR1(nn.Module):
     ):
         super().__init__()
         self.state_dim = state_dim
+        self.fwd_pred_next_n = fwd_pred_next_n
+        if self.state_dim == 7:
+            # ee pose
+            self.arm_dim = 6
+            self.gripper_dim = 1
+        else:
+            # joint states
+            assert self.state_dim == 9
+            self.arm_dim = 7
+            self.gripper_dim = 2
+            
         self.act_dim = act_dim
         self.sequence_length = sequence_length
 
         # GPT
         self.hidden_size = hidden_size
-        config = transformers.GPT2Config(
+        config = GPT2Config(
             vocab_size=1,
             n_embd=hidden_size,
             **kwargs
@@ -304,8 +334,8 @@ class GR1(nn.Module):
         self.without_norm_pixel_loss = without_norm_pixel_loss
 
         # Embedding functions for states
-        self.embed_arm_state = torch.nn.Linear(self.state_dim - 1, hidden_size)
-        self.embed_gripper_state = torch.nn.Linear(2, hidden_size) # one-hot gripper state
+        self.embed_arm_state = torch.nn.Linear(self.arm_dim, hidden_size)
+        self.embed_gripper_state = torch.nn.Linear(self.gripper_dim, hidden_size) # one-hot gripper state
         self.embed_state = torch.nn.Linear(2*hidden_size, hidden_size)
 
         # Relative timestep embedding
@@ -332,10 +362,12 @@ class GR1(nn.Module):
 
         # Action head
         if act_head == 'FC':
-            self.pred_act_head = FcActHead(hidden_size, act_dim)
+            self.pred_act_head = FcActHead(hidden_size, self.arm_dim, self.gripper_dim, chunk_size)
         else:
             assert act_head == 'VAE', f"act_head should be 'FC' or 'VAE', got {act_head}"
-            self.pred_act_head = VAEActHead(hidden_size, act_dim)
+            # TODO: make VAE Policy more flexible
+            self.pred_act_head = VAEPolicy(hidden_size, self.arm_dim, self.gripper_dim, chunk_size, 
+                                           vae_latent_size=64, d_enc=3, d_dec=3, down_sample='none')
         
         # Forward prediction
         self.decoder_embed = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -354,11 +386,14 @@ class GR1(nn.Module):
     def forward(self, 
                 rgb, 
                 state, 
-                language, 
+                text, 
                 attention_mask,
                 hand_rgb=None, 
                 action=None, # to train VAE, we need take actions as input
+                action_mask=None,
+                **kwargs
     ):
+        language = text
         if self.use_hand_rgb:
             assert hand_rgb is not None
 
@@ -374,7 +409,7 @@ class GR1(nn.Module):
         # Embed state
         arm_state = state['arm']
         gripper_state = state['gripper']
-        arm_state_embeddings = self.embed_arm_state(arm_state.view(batch_size, sequence_length, self.state_dim-1))
+        arm_state_embeddings = self.embed_arm_state(arm_state.view(batch_size, sequence_length, self.arm_dim))
         gripper_state_embeddings = self.embed_gripper_state(gripper_state)
         state_embeddings = torch.cat((arm_state_embeddings, gripper_state_embeddings), dim=2)
         state_embeddings = self.embed_state(state_embeddings)  # (b, l, h)
@@ -392,7 +427,12 @@ class GR1(nn.Module):
             hand_obs_embeddings, hand_patch_embeddings = self.model_mae(
                 hand_rgb.view(batch_size*sequence_length, c, h, w))
             hand_obs_embeddings = hand_obs_embeddings.view(batch_size, sequence_length, -1)  # (b, l, img_feat_dim)
+
+        # Forward prediction
+        obs_loss_mask = None
         if self.fwd_pred:
+            obs_loss_mask = attention_mask[:, self.fwd_pred_next_n:]
+
             p = self.patch_size
             h_p = h // p
             w_p = w // p
@@ -403,6 +443,8 @@ class GR1(nn.Module):
                 # norm the target 
                 obs_targets = (obs_targets - obs_targets.mean(dim=-1, keepdim=True)
                     ) / (obs_targets.var(dim=-1, unbiased=True, keepdim=True).sqrt() + 1e-6)
+            obs_targets = obs_targets[:, self.fwd_pred_next_n:]  # (b, l-fwd_pred_next_n, n_patches, p*p*3)
+
             if self.fwd_pred_hand:
                 hand_rgb = hand_rgb.reshape(shape=(batch_size, sequence_length, 3, h_p, p, w_p, p))
                 obs_hand_targets = hand_rgb.permute(0, 1, 3, 5, 4, 6, 2)
@@ -410,7 +452,8 @@ class GR1(nn.Module):
                 if not self.without_norm_pixel_loss:
                     # norm the target 
                     obs_hand_targets = (obs_hand_targets - obs_hand_targets.mean(dim=-1, keepdim=True)
-                        ) / (obs_hand_targets.var(dim=-1, unbiased=True, keepdim=True).sqrt() + 1e-6)            
+                        ) / (obs_hand_targets.var(dim=-1, unbiased=True, keepdim=True).sqrt() + 1e-6)   
+                obs_hand_targets = obs_hand_targets[:, self.fwd_pred_next_n:]  # (b, l-fwd_pred_next_n, n_patches, p*p*3)         
 
         # Use resampler to process patch embeddings
         patch_embeddings = patch_embeddings.unsqueeze(1)  # (b * l, 1, n_patches, patch_feat_dim)
@@ -459,6 +502,7 @@ class GR1(nn.Module):
             action_queries = self.action_queries.weight  # (1, h)
             action_queries = action_queries.view(1, 1, 1, self.hidden_size).repeat(batch_size, sequence_length, 1, 1)  # (b, l, 1, h)
             stacked_inputs = torch.cat((stacked_inputs, action_queries), dim=2)  # (b, l, n_tokens, h)
+        
         if self.fwd_pred:
             obs_queries = self.obs_queries.weight  # (n_patch_latents + 1, h)
             obs_queries = obs_queries.view(1, 1, self.n_patch_latents + 1, self.hidden_size).repeat(batch_size, sequence_length, 1, 1)  # (b, l, n_patch_latents + 1, h)
@@ -528,9 +572,9 @@ class GR1(nn.Module):
             arm_action_preds = prediction['arm_action_preds']
             gripper_action_preds = prediction['gripper_action_preds']
             mu = prediction.get('mu', None)
-            log_sigma = prediction.get('log_sigma', None)
+            logvar = prediction.get('logvar', None)
 
-        # Forward prediction
+
         if self.fwd_pred:
             mask_token = self.mask_token  # (1, 1, 1, h)
             mask_tokens = mask_token.repeat(batch_size, sequence_length, (self.image_size//self.patch_size)**2, 1)  # (b, l, n_patches, h)
@@ -545,6 +589,7 @@ class GR1(nn.Module):
             obs_preds = self.decoder_pred(obs_pred_)  # (b * l, n_patches + n_patch_latens + 1, h)
             obs_preds = obs_preds.reshape(batch_size, sequence_length, -1, obs_preds.shape[-1])  # (b, l, n_patches + n_patch_latens + 1, h)
             obs_preds = obs_preds[:, :, (self.n_patch_latents+n_obs_tokens):]  # (b, l, n_patches, h)
+            obs_preds = obs_preds[:, :-self.fwd_pred_next_n]  # (b, l-fwd_pred_next_n, n_patches, h)
 
             if self.fwd_pred_hand:
                 obs_pred_hand = self.decoder_embed(x[:, :, obs_hand_query_token_start_i:(obs_hand_query_token_start_i + self.n_patch_latents + n_obs_tokens)])
@@ -556,15 +601,21 @@ class GR1(nn.Module):
                 obs_hand_preds = self.decoder_pred(obs_pred_hand_)
                 obs_hand_preds = obs_hand_preds.reshape(batch_size, sequence_length, -1, obs_hand_preds.shape[-1])
                 obs_hand_preds = obs_hand_preds[:, :, (self.n_patch_latents+n_obs_tokens):]
+                obs_hand_preds = obs_hand_preds[:, :-self.fwd_pred_next_n]
         
         prediction = {
             'obs_preds': obs_preds, # (b, l, n_patches, p*p*3)
             'obs_targets': obs_targets, # (b, l, n_patches, p*p*3)
             'obs_hand_preds': obs_hand_preds, # (b, l, n_patches, p*p*3)
             'obs_hand_targets': obs_hand_targets, # (b, l, n_patches, p*p*3)
+            'obs_loss_mask': obs_loss_mask,
             'arm_action_preds': arm_action_preds, # (b, l, act_dim - 1)
+            'arm_action_targets': action[:, :, :, :self.arm_dim], # (b, l, chunk_size, arm_dim)
             'gripper_action_preds': gripper_action_preds, # (b, l, 1)
+            'gripper_action_targets': action[:, :, :, -self.gripper_dim:], # b, l, chunk_size, gripper_dim)
+            'action_loss_mask': action_mask,
             'mu': mu, 
-            'log_sigma': log_sigma,
+            'logvar': logvar,
         }
         return prediction
+
