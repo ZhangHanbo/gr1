@@ -8,7 +8,8 @@
         "obs_loss_weight": 0.1,
         "arm_loss_weight": 30,
         "gripper_loss_weight": 1,
-        "kl_loss_weight": 0.1
+        "kl_loss_weight": 0.1,
+        "clip_norm": 5.0
     },
     "dataset": {
         "data_dir": "/data/home/hanbo/datasets/fetch_data",
